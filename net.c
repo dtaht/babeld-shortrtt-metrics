@@ -38,14 +38,19 @@ THE SOFTWARE.
 #include "util.h"
 #include "net.h"
 
+-		now = time(NULL);
++		clock_gettime(CLOCK_MONOTONIC, &now);
+-			if(keyexpires <= now) {
++			if(keyexpires <= now.tv_sec) {
+
 int
 babel_socket(int port)
 {
     struct sockaddr_in6 sin6;
     int s, rc;
     int saved_errno;
-    int one = 1, zero = 0;
-    const int ds = 0xc0;        /* CS6 - Network Control */
+    const int one = 1, zero = 0;
+    const int ds = 0xc2;        /* CS6 - Network Control + ecn */
 
     s = socket(PF_INET6, SOCK_DGRAM, 0);
     if(s < 0)
@@ -83,6 +88,32 @@ babel_socket(int port)
     if(rc < 0)
         perror("Couldn't set traffic class");
 
+#ifdef IPV6_RECVTCLASS
+    rc = setsockopt(s, IPPROTO_IPV6, IPV6_RECVTCLASS, (void *)&one, sizeof option);
+#else
+    rc = -1;
+    errno = ENOSYS;
+#endif
+    if(rc < 0)
+        perror("Couldn't set recv traffic class");
+#ifdef IPV6_RECHOPLIMIT    
+    rc = setsockopt(nfd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, (void *)&one, sizeof option);
+#else
+    rc = -1;
+    errno = ENOSYS;
+#endif
+    if(rc < 0)
+        perror("Couldn't set recv hop limit");
+    
+#ifdef SO_TIMESTAMPNS
+    rc = setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, (void *)&one, sizeof option);
+#else
+    rc = -1;
+    errno = ENOSYS;
+#endif
+    if(rc < 0)
+        perror("Couldn't set kernel timestamps");
+
     rc = fcntl(s, F_GETFL, 0);
     if(rc < 0)
         goto fail;
@@ -115,11 +146,61 @@ babel_socket(int port)
     return -1;
 }
 
+/* Tight granularity of timestamps is helpful */
+
+typedef struct packet_data {
+  uint8_t tos;
+  uint8_t hopcount;
+  struct timespec tstamp;
+} packet_data_t;
+
+
+ parse_header(  packet_data_t *pd, *msg) {
+  for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+  switch (cmsg->cmsg_level) {
+  case SOL_SOCKET:
+    switch (cmsg->cmsg_type) {
+    case SO_TIMESTAMPNS: {
+      struct timespec *stamp =
+	(struct timespec *)CMSG_DATA(cmsg);
+      logger(LOG_INFO,"SOL_SOCKET SO_TIMESTAMPNS %ld.%09ld",
+	     (long)stamp->tv_sec,
+	     (long)stamp->tv_nsec);
+      break;
+    }
+    default:
+      logger(LOG_ERR,"unrecognised SOL_SOCKET cmsg type %d", cmsg->cmsg_type);
+      break;
+    }
+    break;
+  case IPPROTO_IPV6:
+    switch (cmsg->cmsg_type) {
+    case IPV6_HOPLIMIT:
+      pd->ttl = *((int *) CMSG_DATA(cmsg)) & 0xff;
+      logger(LOG_INFO,"IPPROTO_IPV6: ttl: %d", *(int *) CMSG_DATA(cmsg));
+      break;
+    case IPV6_RECVTCLASS:
+      pd->tos = (uint8_t*) CMSG_DATA(cmsg);
+      logger(LOG_INFO,"IPPROTO_IPV6: tos: %d", pkt.outer_tos);
+      break;
+    default:
+      logger(LOG_ERR,"IPPROTO_IPV6 unrecognised cmsg level %d type %d",
+	     cmsg->cmsg_level,
+	     cmsg->cmsg_type);
+      break;
+    }
+    
+    break;
+ }
+}
+ 
 int
 babel_recv(int s, void *buf, int buflen, struct sockaddr *sin, int slen)
 {
-    struct iovec iovec;
+    struct iovec iovec[10];
     struct msghdr msg;
+    struct cmsghdr *msg;
+    char buf[CMSG_SPACE(sizeof(int))];
     int rc;
 
     memset(&msg, 0, sizeof(msg));
@@ -128,9 +209,10 @@ babel_recv(int s, void *buf, int buflen, struct sockaddr *sin, int slen)
     msg.msg_name = sin;
     msg.msg_namelen = slen;
     msg.msg_iov = &iovec;
-    msg.msg_iovlen = 1;
+    msg.msg_iovlen = 4;
 
     rc = recvmsg(s, &msg, 0);
+    if(rc>-1) parse_header(pd,msg);
     return rc;
 }
 
